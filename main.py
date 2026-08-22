@@ -1,11 +1,14 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import base64
 import json
 import math
 
+app = FastAPI()
 
-HOST = "0.0.0.0"
-PORT = 8000
+
+class SolveRequest(BaseModel):
+    payload: str
 
 
 PRIORITY_MAP = {
@@ -20,6 +23,7 @@ def adapt_input(adapt_input):
     metadata = adapt_input.get("metadata", {})
 
     action = adapt_input.get("action")
+
     if action is not None:
         action = action.lower()
 
@@ -39,9 +43,6 @@ def adapt_input(adapt_input):
 def percentile(values, percentile_value):
     """
     Nearest-rank percentile.
-
-    For example:
-    [120, 180] -> P95 = 180
     """
 
     if not values:
@@ -59,10 +60,10 @@ def percentile(values, percentile_value):
 
 
 def calculate_slo(heartbeats, slo_query):
+
     service = slo_query.get("service")
     since = slo_query.get("since", 0)
 
-    # Filter heartbeats
     filtered = [
         heartbeat
         for heartbeat in heartbeats
@@ -70,14 +71,12 @@ def calculate_slo(heartbeats, slo_query):
         and heartbeat.get("timestamp", 0) >= since
     ]
 
-    # No matching heartbeat
     if not filtered:
         return {
             "availability": 0,
             "p95LatencyMs": None
         }
 
-    # Count successful heartbeats
     successful = sum(
         1
         for heartbeat in filtered
@@ -86,7 +85,6 @@ def calculate_slo(heartbeats, slo_query):
 
     availability = successful / len(filtered)
 
-    # Get latency values
     latencies = [
         heartbeat.get("latencyMs")
         for heartbeat in filtered
@@ -107,141 +105,46 @@ def calculate_slo(heartbeats, slo_query):
     }
 
 
-def solve(payload):
-    # 1. Base64 decode
-    decoded_bytes = base64.b64decode(payload)
+@app.post("/solve")
+def solve(request: SolveRequest):
 
-    # 2. Convert bytes to string
-    decoded_string = decoded_bytes.decode("utf-8")
+    try:
 
-    # 3. Parse JSON
-    data = json.loads(decoded_string)
+        # Decode Base64
+        decoded_bytes = base64.b64decode(
+            request.payload
+        )
 
-    # 4. Adapt input
-    adapt_output = adapt_input(
-        data.get("adaptInput", {})
-    )
+        # Bytes -> String
+        decoded_string = decoded_bytes.decode(
+            "utf-8"
+        )
 
-    # 5. Calculate SLO
-    slo_output = calculate_slo(
-        data.get("heartbeats", []),
-        data.get("sloQuery", {})
-    )
+        # String -> JSON
+        data = json.loads(
+            decoded_string
+        )
 
-    # 6. Combine response
-    return {
-        "adaptOutput": adapt_output,
-        "sloOutput": slo_output
-    }
+        # Adapt V1 -> V2
+        adapt_output = adapt_input(
+            data.get("adaptInput", {})
+        )
 
+        # Calculate SLO
+        slo_output = calculate_slo(
+            data.get("heartbeats", []),
+            data.get("sloQuery", {})
+        )
 
-class SolveHandler(BaseHTTPRequestHandler):
+        # Combined response
+        return {
+            "adaptOutput": adapt_output,
+            "sloOutput": slo_output
+        }
 
-    def do_POST(self):
+    except Exception as e:
 
-        # Only accept /solve
-        if self.path != "/solve":
-            self.send_response(404)
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-            self.end_headers()
-
-            response = {
-                "error": "Not Found"
-            }
-
-            self.wfile.write(
-                json.dumps(response).encode("utf-8")
-            )
-
-            return
-
-        try:
-            # Read request body
-            content_length = int(
-                self.headers.get(
-                    "Content-Length",
-                    0
-                )
-            )
-
-            body = self.rfile.read(
-                content_length
-            )
-
-            # Parse request JSON
-            request_data = json.loads(
-                body.decode("utf-8")
-            )
-
-            # Get payload
-            payload = request_data["payload"]
-
-            # Solve
-            result = solve(payload)
-
-            # Convert result to JSON
-            response = json.dumps(
-                result
-            ).encode("utf-8")
-
-            # Send response
-            self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(response))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(response)
-
-        except Exception as e:
-
-            response = json.dumps({
-                "error": str(e)
-            }).encode("utf-8")
-
-            self.send_response(400)
-
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-
-            self.send_header(
-                "Content-Length",
-                str(len(response))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(response)
-
-
-if __name__ == "__main__":
-
-    server = HTTPServer(
-        (HOST, PORT),
-        SolveHandler
-    )
-
-    print(
-        f"Server running on "
-        f"http://localhost:{PORT}"
-    )
-
-    print(
-        "POST requests to "
-        f"http://localhost:{PORT}/solve"
-    )
-
-    server.serve_forever()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid payload: {str(e)}"
+        )
