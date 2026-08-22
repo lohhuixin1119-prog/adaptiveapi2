@@ -1,29 +1,24 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
 import base64
-import json
 import math
+import orjson
+from fastapi import FastAPI, Request
+from fastapi.responses import ORJSONResponse
 
-app = FastAPI()
+# Default to ORJSONResponse for lightning-fast output serialization
+app = FastAPI(default_response_class=ORJSONResponse)
 
-# Pre-allocate dictionary in memory for O(1) lookups
-PRIORITY_MAP = {
-    "LOW": 1,
-    "MEDIUM": 2,
-    "HIGH": 3,
-    "CRITICAL": 4
-}
-
-# Only validate the outermost layer to satisfy the framework requirement
-class SolveRequest(BaseModel):
-    payload: str
+PRIORITY_MAP = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 @app.post("/solve")
-def solve_fast(request: SolveRequest):
-    # 1. Fast Decode: Load JSON directly into native Python dictionaries
-    data = json.loads(base64.b64decode(request.payload))
+async def solve_extreme(request: Request):
+    # 1. Bypass Pydantic: Parse the outer JSON natively
+    body = await request.json()
+    
+    # 2. Ultra-fast Decode: orjson parses raw bytes directly
+    raw_bytes = base64.b64decode(body["payload"])
+    data = orjson.loads(raw_bytes)
 
-    # 2. Fast Adapt: O(1) dictionary access
+    # 3. Adapt Input (O(1) Access)
     adapt_in = data["adaptInput"]
     metadata = adapt_in.get("metadata", {})
     
@@ -34,39 +29,31 @@ def solve_fast(request: SolveRequest):
         "priority": PRIORITY_MAP.get(metadata.get("priority", "LOW").upper(), 1)
     }
 
-    # 3. Fast Metrics: Single-Pass O(N) Processing
+    # 4. Filter and Calculate
     slo_query = data.get("sloQuery", {})
     target_service = slo_query.get("service")
     target_since = slo_query.get("since", 0)
     
-    ok_count = 0
     latencies = []
+    ok_count = 0
     
-    # We loop through the data exactly ONCE. 
-    # Using `.get()` avoids KeyError checks while remaining highly optimized.
     for hb in data.get("heartbeats", []):
         if hb.get("service") == target_service and hb.get("timestamp", 0) >= target_since:
             latencies.append(hb.get("latencyMs", 0))
             if hb.get("status") == "OK":
                 ok_count += 1
                 
-    total_filtered = len(latencies)
-    
-    # Handle zero-division edge case immediately
-    if total_filtered == 0:
-        return {
-            "adaptOutput": adapt_out,
-            "sloOutput": {"availability": 0.0, "p95LatencyMs": 0}
-        }
+    total = len(latencies)
+    if total == 0:
+        return {"adaptOutput": adapt_out, "sloOutput": {"availability": 0.0, "p95LatencyMs": 0}}
         
-    # 4. Fast Percentile: O(K log K) sort only on the filtered subset
     latencies.sort()
-    p95_index = max(0, math.ceil(0.95 * total_filtered) - 1)
+    p95_idx = max(0, math.ceil(0.95 * total) - 1)
     
     return {
         "adaptOutput": adapt_out,
         "sloOutput": {
-            "availability": ok_count / total_filtered,
-            "p95LatencyMs": latencies[p95_index]
+            "availability": ok_count / total,
+            "p95LatencyMs": latencies[p95_idx]
         }
     }
