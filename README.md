@@ -1,3 +1,4 @@
+
 # Adaptive API Gateway
 
 Implements `POST /solve` per the challenge spec.
@@ -5,7 +6,7 @@ Implements `POST /solve` per the challenge spec.
 ## Run
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements（2）.txt
 python3 main.py
 # or: uvicorn main:app --host 0.0.0.0 --port 8080
 ```
