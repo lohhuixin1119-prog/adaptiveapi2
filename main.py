@@ -1,44 +1,53 @@
-"""
-Adaptive API Gateway Challenge - FastAPI Server (Python)
-Configured for Uvicorn / FastAPI deployment on Render.
-Exposes POST /solve
-"""
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from solver import decode_payload, solve_challenge
-app = FastAPI(
-    title="Adaptive API Gateway",
-    description="Adaptive API Gateway Challenge Server"
-)
-# CORS middleware configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-@app.get("/")
-@app.get("/health")
-def health_check():
-    return {
-        "status": "ok",
-        "message": "Adaptive API Gateway (FastAPI) server running"
-    }
-@app.post("/solve")
-async def solve_endpoint(request: Request):
+import base64
+import json
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+
+# Import our enterprise modules
+from schemas import EncodedPayloadRequest, DecodedPayload, SolveResponse
+from adapter import V1ToV2Adapter
+from metrics import SLOMetricsCalculator
+
+app = FastAPI(title="Adaptive API Gateway V2")
+
+@app.post("/solve", response_model=SolveResponse)
+async def solve_gateway_challenge(request: EncodedPayloadRequest):
     try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    try:
-        payload_data = decode_payload(body)
-        result = solve_challenge(payload_data)
-        return result
+        # 1. Decode Base64 string safely
+        try:
+            decoded_bytes = base64.b64decode(request.payload)
+            raw_json_string = decoded_bytes.decode('utf-8')
+            parsed_dict = json.loads(raw_json_string)
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid payload encoding: {str(e)}")
+
+        # 2. Validate the decoded JSON against our strict Pydantic schemas
+        try:
+            validated_payload = DecodedPayload(**parsed_dict)
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=e.errors())
+
+        # 3. Delegate to Domain Services
+        adapt_out = V1ToV2Adapter.transform(validated_payload.adaptInput)
+        slo_out = SLOMetricsCalculator.calculate(
+            heartbeats=validated_payload.heartbeats,
+            query=validated_payload.sloQuery
+        )
+
+        # 4. Construct and return final validated response
+        return SolveResponse(
+            adaptOutput=adapt_out,
+            sloOutput=slo_out
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Bad Request: {str(e)}")
+        # Catch-all for unexpected server errors (500)
+        raise HTTPException(status_code=500, detail=f"Internal Gateway Error: {str(e)}")
+
 if __name__ == "__main__":
-    import os
     import uvicorn
-    port = int(os.environ.get("PORT", 3000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    # Run server programmatically if executed directly
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
