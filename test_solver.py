@@ -1,6 +1,6 @@
 """
 Test suite for Adaptive API Gateway Challenge (Python)
-Test suite for Adaptive API Gateway Challenge (Python WSGI)
+Test suite for Adaptive API Gateway Challenge (Python WSGI & FastAPI)
 """
 import json
 import threading
@@ -11,7 +11,7 @@ from http.server import HTTPServer
 from wsgiref.simple_server import make_server
 from solver import decode_payload, parse_priority, solve_challenge
 from server import GatewayHandler
-from server import app
+from server import app as wsgi_app
 TEST_PORT = 3002
 TEST_PORT = 3003
 class TestAdaptiveGateway(unittest.TestCase):
@@ -19,7 +19,7 @@ class TestAdaptiveGateway(unittest.TestCase):
     def test_http_endpoint_post_solve(self):
         server_address = ('127.0.0.1', TEST_PORT)
         httpd = HTTPServer(server_address, GatewayHandler)
-        httpd = make_server('127.0.0.1', TEST_PORT, app)
+        httpd = make_server('127.0.0.1', TEST_PORT, wsgi_app)
         server_thread = threading.Thread(target=httpd.serve_forever)
         server_thread.daemon = True
         server_thread.start()
