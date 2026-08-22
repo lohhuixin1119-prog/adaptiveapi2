@@ -2,20 +2,17 @@ import base64
 import json
 import math
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from fastapi import FastAPI, Request, status
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
-app = FastAPI(title="Adaptive API Gateway", version="2.0")
+app = FastAPI(title="Adaptive API Gateway", version="3.0")
 
 
-class SolveRequest(BaseModel):
-    payload: str = Field(..., description="Base64-encoded JSON payload")
-
+# ---------- 辅助工具函数 ----------
 
 def safe_int(val: Any, default: int = 0) -> int:
+    """安全转换为 int，兼容 "120" 或 120.0"""
     try:
         return int(float(val))
     except (ValueError, TypeError):
@@ -23,6 +20,7 @@ def safe_int(val: Any, default: int = 0) -> int:
 
 
 def safe_float(val: Any, default: float = 0.0) -> float:
+    """安全转换为 float"""
     try:
         return float(val)
     except (ValueError, TypeError):
@@ -30,20 +28,29 @@ def safe_float(val: Any, default: float = 0.0) -> float:
 
 
 def calculate_p95(latencies: List[int]) -> int:
-    """Calculates 95th percentile with linear interpolation/nearest rank safety."""
+    """
+    兼顾 Nearest-Rank 与 Percentile 边界的 P95 计算
+    """
     n = len(latencies)
     if n == 0:
         return 0
     if n == 1:
         return latencies[0]
 
-    # Standard Nearest Rank method
-    rank = math.ceil(0.95 * n) - 1
-    rank = max(0, min(rank, n - 1))
-    return latencies[rank]
+    # 排序
+    sorted_lat = sorted(latencies)
+    
+    # 标准 Nearest-Rank 公式: rank = ceil(0.95 * N)
+    # 映射到 0-based index: index = ceil(0.95 * N) - 1
+    idx = math.ceil(0.95 * n) - 1
+    clamped_idx = max(0, min(idx, n - 1))
+    
+    return sorted_lat[clamped_idx]
 
 
-def compute_adapt_output(adapt_input: Any) -> Dict[str, Any]:
+# ---------- 核心业务处理 ----------
+
+def process_adapt_input(adapt_input: Any) -> Dict[str, Any]:
     if not isinstance(adapt_input, dict):
         adapt_input = {}
 
@@ -55,22 +62,28 @@ def compute_adapt_output(adapt_input: Any) -> Dict[str, Any]:
     if not isinstance(metadata, dict):
         metadata = {}
 
+    # 1. Action 处理: 强制转小写，若缺失则为空字符串
+    raw_action = adapt_input.get("action")
+    action_str = str(raw_action).strip().lower() if raw_action is not None else ""
+
+    # 2. Priority 映射: HIGH->3, MEDIUM->2, LOW->1, 其他->0
     priority_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
     raw_priority = str(metadata.get("priority", "")).strip().upper()
     priority_val = priority_map.get(raw_priority, 0)
 
-    raw_action = adapt_input.get("action")
-    action_val = str(raw_action).strip().lower() if raw_action is not None else ""
+    # 3. User 字段提取: 保证键存在，缺失则为 None (对应 JSON null)
+    user_id = user.get("id")
+    full_name = user.get("fullName")
 
     return {
-        "id": user.get("id"),
-        "name": user.get("fullName"),
-        "action": action_val,
+        "id": str(user_id) if user_id is not None else None,
+        "name": str(full_name) if full_name is not None else None,
+        "action": action_str,
         "priority": priority_val
     }
 
 
-def compute_slo_output(heartbeats: Any, slo_query: Any) -> Dict[str, Any]:
+def process_slo_output(heartbeats: Any, slo_query: Any) -> Dict[str, Any]:
     if not isinstance(slo_query, dict):
         slo_query = {}
     if not isinstance(heartbeats, list):
@@ -79,10 +92,12 @@ def compute_slo_output(heartbeats: Any, slo_query: Any) -> Dict[str, Any]:
     target_service = str(slo_query.get("service", "")).strip()
     since_ts = safe_float(slo_query.get("since", 0))
 
+    # 过滤符合条件的心跳包
     relevant = []
     for hb in heartbeats:
         if isinstance(hb, dict):
             hb_service = str(hb.get("service", "")).strip()
+            # 只有 service 匹配且 timestamp >= since 才纳入统计
             if hb_service == target_service:
                 hb_ts = safe_float(hb.get("timestamp", 0))
                 if hb_ts >= since_ts:
@@ -95,7 +110,7 @@ def compute_slo_output(heartbeats: Any, slo_query: Any) -> Dict[str, Any]:
             "p95LatencyMs": 0
         }
 
-    # Calculate Availability
+    # 计算 Availability 与 提取 Latency
     ok_count = 0
     latencies = []
     for hb in relevant:
@@ -104,62 +119,91 @@ def compute_slo_output(heartbeats: Any, slo_query: Any) -> Dict[str, Any]:
             ok_count += 1
         latencies.append(safe_int(hb.get("latencyMs", 0)))
 
+    # 可用率计算
     availability = ok_count / total
-    latencies.sort()
+    
+    # P95 延迟计算
     p95_val = calculate_p95(latencies)
 
     return {
-        "availability": round(availability, 6),
+        "availability": round(availability, 4),
         "p95LatencyMs": p95_val
     }
 
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"error": "Invalid payload format"}
-    )
-
+# ---------- API 路由 (全手动防御) ----------
 
 @app.post("/solve")
-async def solve(request: SolveRequest):
+async def solve(request: Request):
     try:
-        payload_str = request.payload.strip().replace("\n", "").replace("\r", "")
-        
-        # Add missing base64 padding
-        missing_padding = len(payload_str) % 4
-        if missing_padding:
-            payload_str += "=" * (4 - missing_padding)
+        # 1. 尝试解析请求体 JSON
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "Invalid JSON body"}
+            )
 
-        # Decode base64
-        decoded_bytes = base64.b64decode(payload_str)
-        decoded_str = decoded_bytes.decode("utf-8")
-        
-        # Parse JSON
-        raw_json = json.loads(decoded_str)
-        if not isinstance(raw_json, dict):
+        if not isinstance(body, dict) or "payload" not in body:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "Missing payload field"}
+            )
+
+        raw_payload = body.get("payload")
+        if not isinstance(raw_payload, str):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "Payload must be a string"}
+            )
+
+        # 2. 清洗 Base64 字符串（去除换行、空格）
+        clean_payload = raw_payload.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+
+        # 3. 自动补齐 Base64 Padding
+        missing_padding = len(clean_payload) % 4
+        if missing_padding:
+            clean_payload += "=" * (4 - missing_padding)
+
+        # 4. Base64 解码 & JSON 解析
+        try:
+            decoded_bytes = base64.b64decode(clean_payload)
+            decoded_str = decoded_bytes.decode("utf-8")
+            payload_json = json.loads(decoded_str)
+        except Exception:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "Malformed base64 or internal JSON"}
+            )
+
+        if not isinstance(payload_json, dict):
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"error": "Decoded payload is not a JSON object"}
             )
 
-        adapt_input = raw_json.get("adaptInput")
-        heartbeats = raw_json.get("heartbeats")
-        slo_query = raw_json.get("sloQuery")
+        # 5. 执行核心逻辑
+        adapt_input = payload_json.get("adaptInput")
+        heartbeats = payload_json.get("heartbeats")
+        slo_query = payload_json.get("sloQuery")
 
-        adapt_out = compute_adapt_output(adapt_input)
-        slo_out = compute_slo_output(heartbeats, slo_query)
+        adapt_out = process_adapt_input(adapt_input)
+        slo_out = process_slo_output(heartbeats, slo_query)
 
-        return {
-            "adaptOutput": adapt_out,
-            "sloOutput": slo_out
-        }
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "adaptOutput": adapt_out,
+                "sloOutput": slo_out
+            }
+        )
 
-    except Exception:
+    except Exception as e:
+        # 捕获所有未知的兜底异常，绝不崩溃返回 500
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": "Invalid or malformed base64 payload"}
+            content={"error": "Unhandled request processing error"}
         )
 
 
