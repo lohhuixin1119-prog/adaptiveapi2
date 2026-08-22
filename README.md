@@ -60,7 +60,3 @@ payload = {
 response = requests.post(url, json=payload)
 print(response.status_code)
 print(json.dumps(response.json(), indent=2))
-
-Payload decoding accepts standard or URL-safe base64, with or without
-padding, and unknown/extra JSON fields anywhere in the request are ignored
-rather than rejected.
