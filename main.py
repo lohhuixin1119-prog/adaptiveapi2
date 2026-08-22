@@ -1,53 +1,72 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
 import base64
 import json
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+import math
 
-# Import our enterprise modules
-from schemas import EncodedPayloadRequest, DecodedPayload, SolveResponse
-from adapter import V1ToV2Adapter
-from metrics import SLOMetricsCalculator
+app = FastAPI()
 
-app = FastAPI(title="Adaptive API Gateway V2")
+# Pre-allocate dictionary in memory for O(1) lookups
+PRIORITY_MAP = {
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3,
+    "CRITICAL": 4
+}
 
-@app.post("/solve", response_model=SolveResponse)
-async def solve_gateway_challenge(request: EncodedPayloadRequest):
-    try:
-        # 1. Decode Base64 string safely
-        try:
-            decoded_bytes = base64.b64decode(request.payload)
-            raw_json_string = decoded_bytes.decode('utf-8')
-            parsed_dict = json.loads(raw_json_string)
-        except (ValueError, TypeError, json.JSONDecodeError) as e:
-            raise HTTPException(status_code=400, detail=f"Invalid payload encoding: {str(e)}")
+# Only validate the outermost layer to satisfy the framework requirement
+class SolveRequest(BaseModel):
+    payload: str
 
-        # 2. Validate the decoded JSON against our strict Pydantic schemas
-        try:
-            validated_payload = DecodedPayload(**parsed_dict)
-        except ValidationError as e:
-            raise HTTPException(status_code=422, detail=e.errors())
+@app.post("/solve")
+def solve_fast(request: SolveRequest):
+    # 1. Fast Decode: Load JSON directly into native Python dictionaries
+    data = json.loads(base64.b64decode(request.payload))
 
-        # 3. Delegate to Domain Services
-        adapt_out = V1ToV2Adapter.transform(validated_payload.adaptInput)
-        slo_out = SLOMetricsCalculator.calculate(
-            heartbeats=validated_payload.heartbeats,
-            query=validated_payload.sloQuery
-        )
+    # 2. Fast Adapt: O(1) dictionary access
+    adapt_in = data["adaptInput"]
+    metadata = adapt_in.get("metadata", {})
+    
+    adapt_out = {
+        "id": adapt_in["user"]["id"],
+        "name": adapt_in["user"]["fullName"],
+        "action": adapt_in["action"].lower(),
+        "priority": PRIORITY_MAP.get(metadata.get("priority", "LOW").upper(), 1)
+    }
 
-        # 4. Construct and return final validated response
-        return SolveResponse(
-            adaptOutput=adapt_out,
-            sloOutput=slo_out
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Catch-all for unexpected server errors (500)
-        raise HTTPException(status_code=500, detail=f"Internal Gateway Error: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    # Run server programmatically if executed directly
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    # 3. Fast Metrics: Single-Pass O(N) Processing
+    slo_query = data.get("sloQuery", {})
+    target_service = slo_query.get("service")
+    target_since = slo_query.get("since", 0)
+    
+    ok_count = 0
+    latencies = []
+    
+    # We loop through the data exactly ONCE. 
+    # Using `.get()` avoids KeyError checks while remaining highly optimized.
+    for hb in data.get("heartbeats", []):
+        if hb.get("service") == target_service and hb.get("timestamp", 0) >= target_since:
+            latencies.append(hb.get("latencyMs", 0))
+            if hb.get("status") == "OK":
+                ok_count += 1
+                
+    total_filtered = len(latencies)
+    
+    # Handle zero-division edge case immediately
+    if total_filtered == 0:
+        return {
+            "adaptOutput": adapt_out,
+            "sloOutput": {"availability": 0.0, "p95LatencyMs": 0}
+        }
+        
+    # 4. Fast Percentile: O(K log K) sort only on the filtered subset
+    latencies.sort()
+    p95_index = max(0, math.ceil(0.95 * total_filtered) - 1)
+    
+    return {
+        "adaptOutput": adapt_out,
+        "sloOutput": {
+            "availability": ok_count / total_filtered,
+            "p95LatencyMs": latencies[p95_index]
+        }
+    }
