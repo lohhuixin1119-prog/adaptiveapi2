@@ -1,381 +1,168 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import base64
-import binascii
 import json
 import math
 import os
+from typing import Optional
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Adaptive API Gateway", version="2.0")
 
 
-app = FastAPI()
-
-
-# ==========================================
-# Request model
-# ==========================================
+# ---------- Pydantic Response Schemas ----------
 
 class SolveRequest(BaseModel):
-    payload: str
+    payload: str = Field(..., description="Base64-encoded JSON payload")
 
 
-# ==========================================
-# Priority mapping
-# ==========================================
-
-PRIORITY_MAP = {
-    "LOW": 1,
-    "MEDIUM": 2,
-    "HIGH": 3
-}
+class AdaptOutput(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    action: str
+    priority: int
 
 
-# ==========================================
-# Health check
-# ==========================================
-
-@app.get("/")
-def home():
-    return {
-        "status": "ok",
-        "message": "Adaptive API Gateway is running"
-    }
+class SloOutput(BaseModel):
+    availability: float
+    p95LatencyMs: int
 
 
-# ==========================================
-# Adapt input
-# ==========================================
-
-def adapt_input(data):
-    user = data.get("user") or {}
-    metadata = data.get("metadata") or {}
-
-    # User ID
-    user_id = user.get("id")
-
-    # Full name
-    name = user.get("fullName")
-
-    # Action
-    action = data.get("action")
-
-    if isinstance(action, str):
-        action = action.lower()
-
-    # Priority
-    priority = metadata.get("priority")
-
-    if isinstance(priority, str):
-        priority = PRIORITY_MAP.get(
-            priority.upper()
-        )
-
-    return {
-        "id": user_id,
-        "name": name,
-        "action": action,
-        "priority": priority
-    }
+class SolveResponse(BaseModel):
+    adaptOutput: AdaptOutput
+    sloOutput: SloOutput
 
 
-# ==========================================
-# P95
-# ==========================================
+# ---------- Core Safe Business Logic ----------
 
-def calculate_p95(values):
+def compute_adapt_output(adapt_input: dict) -> AdaptOutput:
+    """Transforms adaptInput to adaptOutput safely, handling missing values and casing."""
+    user = adapt_input.get("user") or {}
+    metadata = adapt_input.get("metadata") or {}
 
-    if not values:
-        return None
+    priority_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    
+    # Clean input strings
+    raw_priority = str(metadata.get("priority", "")).strip().upper()
+    raw_action = str(adapt_input.get("action", "")).strip()
 
-    values = sorted(values)
-
-    # Nearest-rank percentile
-    rank = math.ceil(
-        0.95 * len(values)
+    return AdaptOutput(
+        id=user.get("id"),
+        name=user.get("fullName"),
+        action=raw_action.lower(),
+        priority=priority_map.get(raw_priority, 0)
     )
 
-    index = max(
-        0,
-        rank - 1
-    )
 
-    return values[index]
+def compute_slo_output(heartbeats: list, slo_query: dict) -> SloOutput:
+    """Calculates availability ratio and nearest-rank P95 latency."""
+    target_service = str(slo_query.get("service", "")).strip()
+    
+    try:
+        since_ts = float(slo_query.get("since", 0))
+    except (ValueError, TypeError):
+        since_ts = 0.0
 
+    # Filter heartbeats with type safety
+    relevant = []
+    if isinstance(heartbeats, list):
+        for hb in heartbeats:
+            if isinstance(hb, dict) and str(hb.get("service", "")).strip() == target_service:
+                try:
+                    hb_ts = float(hb.get("timestamp", 0))
+                    if hb_ts >= since_ts:
+                        relevant.append(hb)
+                except (ValueError, TypeError):
+                    continue
 
-# ==========================================
-# SLO
-# ==========================================
+    total = len(relevant)
+    if total == 0:
+        return SloOutput(availability=0.0, p95LatencyMs=0)
 
-def calculate_slo(heartbeats, query):
-
-    service = query.get("service")
-    since = query.get("since")
-
-    # If since is missing, consider all timestamps
-    if since is None:
-        since = float("-inf")
-
-    # --------------------------------------
-    # Filter heartbeat records
-    # --------------------------------------
-
-    filtered = []
-
-    for heartbeat in heartbeats:
-
-        if not isinstance(heartbeat, dict):
-            continue
-
-        heartbeat_service = heartbeat.get(
-            "service"
-        )
-
-        timestamp = heartbeat.get(
-            "timestamp"
-        )
-
-        if heartbeat_service != service:
-            continue
-
-        if not isinstance(
-            timestamp,
-            (int, float)
-        ):
-            continue
-
-        if timestamp < since:
-            continue
-
-        filtered.append(
-            heartbeat
-        )
-
-    # --------------------------------------
-    # No data
-    # --------------------------------------
-
-    if not filtered:
-        return {
-            "availability": 0,
-            "p95LatencyMs": None
-        }
-
-    # --------------------------------------
-    # Availability
-    # --------------------------------------
-
+    # Calculate Availability
     ok_count = sum(
-        1
-        for heartbeat in filtered
-        if heartbeat.get("status") == "OK"
+        1 for hb in relevant 
+        if str(hb.get("status", "")).strip().upper() == "OK"
     )
+    availability = ok_count / total
 
-    availability = (
-        ok_count / len(filtered)
-    )
-
-    # --------------------------------------
-    # Latencies
-    # --------------------------------------
-
+    # Calculate P95 Latency (Nearest Rank: ceil(0.95 * N) - 1)
     latencies = []
+    for hb in relevant:
+        try:
+            latencies.append(int(hb.get("latencyMs", 0)))
+        except (ValueError, TypeError):
+            latencies.append(0)
+            
+    latencies.sort()
+    
+    # Nearest rank index formula clamped tightly between 0 and total - 1
+    p95_index = math.ceil(0.95 * total) - 1
+    clamped_index = max(0, min(p95_index, total - 1))
+    p95 = latencies[clamped_index]
 
-    for heartbeat in filtered:
-
-        latency = heartbeat.get(
-            "latencyMs"
-        )
-
-        if isinstance(
-            latency,
-            (int, float)
-        ):
-            latencies.append(
-                latency
-            )
-
-    # --------------------------------------
-    # P95
-    # --------------------------------------
-
-    p95_latency = calculate_p95(
-        latencies
+    return SloOutput(
+        availability=round(availability, 4),
+        p95LatencyMs=p95
     )
 
-    return {
-        "availability": availability,
-        "p95LatencyMs": p95_latency
-    }
+
+# ---------- Exception Handlers ----------
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"error": "Invalid request body structure"}
+    )
 
 
-# ==========================================
-# Solve
-# ==========================================
+# ---------- API Endpoints ----------
 
-@app.post("/solve")
-def solve(request: SolveRequest):
-
-    # --------------------------------------
-    # Validate payload
-    # --------------------------------------
-
-    if not request.payload:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing payload"
-        )
-
+@app.post("/solve", response_model=SolveResponse)
+async def solve(request: SolveRequest):
     try:
+        # Clean Base64 string (Remove white spaces and newlines)
+        payload_str = request.payload.strip().replace("\n", "").replace("\r", "")
 
-        # ----------------------------------
-        # Base64 decode
-        # ----------------------------------
+        # Fix base64 padding if missing
+        missing_padding = len(payload_str) % 4
+        if missing_padding:
+            payload_str += "=" * (4 - missing_padding)
 
-        decoded_bytes = base64.b64decode(
-            request.payload,
-            validate=True
+        # Base64 Decode & JSON Parse
+        decoded_bytes = base64.b64decode(payload_str)
+        raw_json = json.loads(decoded_bytes.decode("utf-8"))
+
+        adapt_input = raw_json.get("adaptInput") or {}
+        heartbeats = raw_json.get("heartbeats") or []
+        slo_query = raw_json.get("sloQuery") or {}
+
+        # Compute Response Output
+        adapt_out = compute_adapt_output(adapt_input)
+        slo_out = compute_slo_output(heartbeats, slo_query)
+
+        return SolveResponse(adaptOutput=adapt_out, sloOutput=slo_out)
+
+    except (base64.binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": "Malformed payload or JSON structure"}
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": f"Internal server error: {str(e)}"}
         )
 
-    except (
-        binascii.Error,
-        ValueError
-    ):
 
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Base64 payload"
-        )
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
-    # --------------------------------------
-    # Decode UTF-8
-    # --------------------------------------
-
-    try:
-
-        decoded_text = decoded_bytes.decode(
-            "utf-8"
-        )
-
-    except UnicodeDecodeError:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Payload is not valid UTF-8"
-        )
-
-    # --------------------------------------
-    # Parse JSON
-    # --------------------------------------
-
-    try:
-
-        data = json.loads(
-            decoded_text
-        )
-
-    except json.JSONDecodeError:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Decoded payload is not valid JSON"
-        )
-
-    # --------------------------------------
-    # Validate root object
-    # --------------------------------------
-
-    if not isinstance(data, dict):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Decoded payload must be a JSON object"
-        )
-
-    # --------------------------------------
-    # Extract sections
-    # --------------------------------------
-
-    adapt_input_data = data.get(
-        "adaptInput",
-        {}
-    )
-
-    heartbeats = data.get(
-        "heartbeats",
-        []
-    )
-
-    slo_query = data.get(
-        "sloQuery",
-        {}
-    )
-
-    if not isinstance(
-        adapt_input_data,
-        dict
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="adaptInput must be an object"
-        )
-
-    if not isinstance(
-        heartbeats,
-        list
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="heartbeats must be an array"
-        )
-
-    if not isinstance(
-        slo_query,
-        dict
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="sloQuery must be an object"
-        )
-
-    # --------------------------------------
-    # Generate outputs
-    # --------------------------------------
-
-    adapt_output = adapt_input(
-        adapt_input_data
-    )
-
-    slo_output = calculate_slo(
-        heartbeats,
-        slo_query
-    )
-
-    # --------------------------------------
-    # Final response
-    # --------------------------------------
-
-    return {
-        "adaptOutput": adapt_output,
-        "sloOutput": slo_output
-    }
-
-
-# ==========================================
-# Local development
-# ==========================================
 
 if __name__ == "__main__":
-
     import uvicorn
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            8000
-        )
-    )
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    port = int(os.getenv("PORT", 3000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
