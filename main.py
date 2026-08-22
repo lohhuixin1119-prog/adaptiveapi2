@@ -207,6 +207,13 @@ async def solve(request: Request):
         )
 
 
+# ---------- Root & Health Check Endpoints ----------
+
+@app.get("/")
+async def root():
+    return {"message": "Adaptive API Gateway is running"}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
