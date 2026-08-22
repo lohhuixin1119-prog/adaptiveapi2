@@ -1,91 +1,25 @@
 import base64
 import json
+import math
 import os
-from typing import List, Optional, Dict, Any
-
-from fastapi import FastAPI, HTTPException, Request, status
+from typing import List, Optional
+from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Adaptive API Gateway", version="2.0")
 
 
-# ---------- Pydantic Models (input validation) ----------
-
-class User(BaseModel):
-    id: str = Field(..., description="User identifier")
-    fullName: str = Field(..., description="User's full name")
-
-    # Allow extra fields (if any) silently
-    class Config:
-        extra = "ignore"
-
-
-class Metadata(BaseModel):
-    priority: str = Field(..., description="Priority level: HIGH, MEDIUM, LOW")
-
-    @validator("priority")
-    def validate_priority(cls, v):
-        if v not in {"HIGH", "MEDIUM", "LOW"}:
-            raise ValueError("priority must be HIGH, MEDIUM, or LOW")
-        return v
-
-    class Config:
-        extra = "ignore"
-
-
-class AdaptInput(BaseModel):
-    user: User
-    action: str = Field(..., description="Action like CREATE, UPDATE, DELETE")
-    metadata: Metadata
-
-    class Config:
-        extra = "ignore"
-
-
-class Heartbeat(BaseModel):
-    service: str = Field(..., description="Service name")
-    timestamp: int = Field(..., description="Unix timestamp in seconds")
-    latencyMs: int = Field(..., description="Latency in milliseconds")
-    status: str = Field(..., description="OK or FAIL")
-
-    @validator("status")
-    def validate_status(cls, v):
-        if v not in {"OK", "FAIL"}:
-            raise ValueError("status must be OK or FAIL")
-        return v
-
-    class Config:
-        extra = "ignore"
-
-
-class SloQuery(BaseModel):
-    service: str = Field(..., description="Service name to query")
-    since: int = Field(..., description="Earliest timestamp to include")
-
-    class Config:
-        extra = "ignore"
-
-
-class DecodedPayload(BaseModel):
-    adaptInput: AdaptInput
-    heartbeats: List[Heartbeat] = Field(default_factory=list)
-    sloQuery: SloQuery
-
-    class Config:
-        extra = "ignore"
-
+# ---------- Pydantic Input/Output Schemas ----------
 
 class SolveRequest(BaseModel):
     payload: str = Field(..., description="Base64-encoded JSON payload")
 
 
-# ---------- Response models ----------
-
 class AdaptOutput(BaseModel):
-    id: str
-    name: str
+    id: Optional[str] = None
+    name: Optional[str] = None
     action: str
     priority: int
 
@@ -100,108 +34,109 @@ class SolveResponse(BaseModel):
     sloOutput: SloOutput
 
 
-# ---------- Exception handlers ----------
+# ---------- Core Computation Functions ----------
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors(), "body": exc.body},
-    )
+def compute_adapt_output(adapt_input: dict) -> AdaptOutput:
+    """Transforms adaptInput to adaptOutput safely without throwing validation errors."""
+    user = adapt_input.get("user") or {}
+    metadata = adapt_input.get("metadata") or {}
 
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.detail},
-    )
-
-
-# ---------- Core logic (split for testability) ----------
-
-def compute_adapt_output(adapt_input: AdaptInput) -> AdaptOutput:
-    """Transform adaptInput into adaptOutput per spec."""
     priority_map = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    raw_priority = str(metadata.get("priority", "")).upper()
+    raw_action = str(adapt_input.get("action", ""))
+
     return AdaptOutput(
-        id=adapt_input.user.id,
-        name=adapt_input.user.fullName,
-        action=adapt_input.action.lower(),
-        priority=priority_map.get(adapt_input.metadata.priority, 0),
+        id=user.get("id"),
+        name=user.get("fullName"),
+        action=raw_action.lower(),
+        priority=priority_map.get(raw_priority, 0)
     )
 
 
-def compute_slo_output(heartbeats: List[Heartbeat], slo_query: SloQuery) -> SloOutput:
-    """Calculate availability and p95 latency from filtered heartbeats."""
-    # Filter heartbeats that match service and timestamp >= since
+def compute_slo_output(heartbeats: list, slo_query: dict) -> SloOutput:
+    """Calculates availability and p95 latency using nearest-rank index logic."""
+    target_service = slo_query.get("service")
+    since_ts = slo_query.get("since", 0)
+
+    # Filter heartbeats matching target service and timestamp >= since
     relevant = [
         hb for hb in heartbeats
-        if hb.service == slo_query.service and hb.timestamp >= slo_query.since
+        if isinstance(hb, dict)
+        and hb.get("service") == target_service
+        and hb.get("timestamp", 0) >= since_ts
     ]
 
     total = len(relevant)
     if total == 0:
         return SloOutput(availability=0.0, p95LatencyMs=0)
 
-    ok_count = sum(1 for hb in relevant if hb.status == "OK")
+    # Availability (Case-insensitive status check)
+    ok_count = sum(1 for hb in relevant if str(hb.get("status", "")).upper() == "OK")
     availability = ok_count / total
 
-    # Compute 95th percentile latency using sorted list (efficient for small arrays)
-    latencies = sorted(hb.latencyMs for hb in relevant)
-    # 95th percentile: index = ceil(0.95 * n) - 1 (0-based)
-    idx = max(0, int(0.95 * total) - 1)
-    p95 = latencies[min(idx, total - 1)]
+    # P95 Latency using Nearest Rank: index = ceil(0.95 * N) - 1
+    latencies = sorted(int(hb.get("latencyMs", 0)) for hb in relevant)
+    p95_index = math.ceil(0.95 * total) - 1
+    p95 = latencies[max(0, min(p95_index, total - 1))]
 
-    return SloOutput(availability=availability, p95LatencyMs=p95)
+    return SloOutput(
+        availability=round(availability, 4),
+        p95LatencyMs=p95
+    )
 
 
-# ---------- Main endpoint ----------
+# ---------- Endpoints & Handlers ----------
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"error": "Invalid request body structure"}
+    )
+
 
 @app.post("/solve", response_model=SolveResponse)
 async def solve(request: SolveRequest):
     try:
-        # 1. Decode base64
-        try:
-            decoded_bytes = base64.b64decode(request.payload)
-            decoded_str = decoded_bytes.decode("utf-8")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 encoding")
+        payload_str = request.payload
 
-        # 2. Parse JSON
-        try:
-            raw_json = json.loads(decoded_str)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in decoded payload")
+        # Fix base64 missing padding
+        missing_padding = len(payload_str) % 4
+        if missing_padding:
+            payload_str += "=" * (4 - missing_padding)
 
-        # 3. Validate and deserialize with Pydantic
-        try:
-            decoded = DecodedPayload(**raw_json)
-        except ValueError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+        # Base64 Decode & JSON Parse
+        decoded_bytes = base64.b64decode(payload_str)
+        raw_json = json.loads(decoded_bytes.decode("utf-8"))
 
-        # 4. Compute responses
-        adapt_out = compute_adapt_output(decoded.adaptInput)
-        slo_out = compute_slo_output(decoded.heartbeats, decoded.sloQuery)
+        adapt_input = raw_json.get("adaptInput") or {}
+        heartbeats = raw_json.get("heartbeats") or []
+        slo_query = raw_json.get("sloQuery") or {}
+
+        # Compute output JSON
+        adapt_out = compute_adapt_output(adapt_input)
+        slo_out = compute_slo_output(heartbeats, slo_query)
 
         return SolveResponse(adaptOutput=adapt_out, sloOutput=slo_out)
 
-    except HTTPException:
-        raise
+    except (base64.binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": "Malformed payload or JSON structure"}
+        )
     except Exception as e:
-        # Log the unexpected error (you can add proper logging here)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": f"Internal server error: {str(e)}"}
+        )
 
-
-# ---------- Health check (optional) ----------
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ---------- Run with environment-aware port ----------
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 3000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=bool(os.getenv("DEV")))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
