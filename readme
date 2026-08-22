@@ -1,0 +1,12 @@
+# Adaptive API Gateway (V2)
+
+FastAPI implementation designed to bridge legacy V1 payloads to V2 models and process service-health heartbeat metrics.
+
+## Features
+- **Fault Tolerance**: Safely handles base64 padding issues, malformed JSON, and unexpected null or string-type inputs.
+- **SLO Metrics**: Calculates accurate availability ratios and P95 latency metrics using nearest-rank index logic.
+- **Production-Ready**: Routes exceptions to clear HTTP status codes.
+
+## Endpoints
+- `POST /solve` - Decodes Base64 payloads and produces `adaptOutput` and `sloOutput`.
+- `GET /health` - Health check status endpoint.
