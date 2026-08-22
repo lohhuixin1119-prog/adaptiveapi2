@@ -1,13 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import base64
+import binascii
 import json
 import math
+import os
 
-
-# ==========================================
-# Create FastAPI application
-# ==========================================
 
 app = FastAPI()
 
@@ -32,7 +30,7 @@ PRIORITY_MAP = {
 
 
 # ==========================================
-# Home / Health Check
+# Health check
 # ==========================================
 
 @app.get("/")
@@ -44,21 +42,26 @@ def home():
 
 
 # ==========================================
-# Adapt V1 input -> V2 output
+# Adapt input
 # ==========================================
 
-def adapt_input(adapt_input_data):
+def adapt_input(data):
+    user = data.get("user") or {}
+    metadata = data.get("metadata") or {}
 
-    user = adapt_input_data.get("user", {})
-    metadata = adapt_input_data.get("metadata", {})
+    # User ID
+    user_id = user.get("id")
 
-    # Get action
-    action = adapt_input_data.get("action")
+    # Full name
+    name = user.get("fullName")
 
-    if action is not None:
+    # Action
+    action = data.get("action")
+
+    if isinstance(action, str):
         action = action.lower()
 
-    # Get priority
+    # Priority
     priority = metadata.get("priority")
 
     if isinstance(priority, str):
@@ -67,15 +70,15 @@ def adapt_input(adapt_input_data):
         )
 
     return {
-        "id": user.get("id"),
-        "name": user.get("fullName"),
+        "id": user_id,
+        "name": name,
         "action": action,
         "priority": priority
     }
 
 
 # ==========================================
-# P95 calculation
+# P95
 # ==========================================
 
 def calculate_p95(values):
@@ -99,68 +102,99 @@ def calculate_p95(values):
 
 
 # ==========================================
-# SLO calculation
+# SLO
 # ==========================================
 
-def calculate_slo(heartbeats, slo_query):
+def calculate_slo(heartbeats, query):
 
-    service = slo_query.get("service")
-    since = slo_query.get("since", 0)
+    service = query.get("service")
+    since = query.get("since")
+
+    # If since is missing, consider all timestamps
+    if since is None:
+        since = float("-inf")
 
     # --------------------------------------
     # Filter heartbeat records
     # --------------------------------------
 
-    filtered_heartbeats = [
-        heartbeat
-        for heartbeat in heartbeats
-        if heartbeat.get("service") == service
-        and heartbeat.get("timestamp", 0) >= since
-    ]
+    filtered = []
+
+    for heartbeat in heartbeats:
+
+        if not isinstance(heartbeat, dict):
+            continue
+
+        heartbeat_service = heartbeat.get(
+            "service"
+        )
+
+        timestamp = heartbeat.get(
+            "timestamp"
+        )
+
+        if heartbeat_service != service:
+            continue
+
+        if not isinstance(
+            timestamp,
+            (int, float)
+        ):
+            continue
+
+        if timestamp < since:
+            continue
+
+        filtered.append(
+            heartbeat
+        )
 
     # --------------------------------------
-    # No matching data
+    # No data
     # --------------------------------------
 
-    if not filtered_heartbeats:
+    if not filtered:
         return {
             "availability": 0,
             "p95LatencyMs": None
         }
 
     # --------------------------------------
-    # Calculate availability
+    # Availability
     # --------------------------------------
 
-    successful_count = sum(
+    ok_count = sum(
         1
-        for heartbeat in filtered_heartbeats
+        for heartbeat in filtered
         if heartbeat.get("status") == "OK"
     )
 
-    total_count = len(
-        filtered_heartbeats
-    )
-
     availability = (
-        successful_count / total_count
+        ok_count / len(filtered)
     )
 
     # --------------------------------------
-    # Get latency values
+    # Latencies
     # --------------------------------------
 
-    latencies = [
-        heartbeat.get("latencyMs")
-        for heartbeat in filtered_heartbeats
-        if isinstance(
-            heartbeat.get("latencyMs"),
-            (int, float)
+    latencies = []
+
+    for heartbeat in filtered:
+
+        latency = heartbeat.get(
+            "latencyMs"
         )
-    ]
+
+        if isinstance(
+            latency,
+            (int, float)
+        ):
+            latencies.append(
+                latency
+            )
 
     # --------------------------------------
-    # Calculate P95
+    # P95
     # --------------------------------------
 
     p95_latency = calculate_p95(
@@ -174,92 +208,174 @@ def calculate_slo(heartbeats, slo_query):
 
 
 # ==========================================
-# POST /solve
+# Solve
 # ==========================================
 
 @app.post("/solve")
 def solve(request: SolveRequest):
 
+    # --------------------------------------
+    # Validate payload
+    # --------------------------------------
+
+    if not request.payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing payload"
+        )
+
     try:
 
         # ----------------------------------
-        # 1. Get Base64 payload
-        # ----------------------------------
-
-        encoded_payload = request.payload
-
-        # ----------------------------------
-        # 2. Decode Base64
+        # Base64 decode
         # ----------------------------------
 
         decoded_bytes = base64.b64decode(
-            encoded_payload
+            request.payload,
+            validate=True
         )
 
-        # ----------------------------------
-        # 3. Convert bytes -> string
-        # ----------------------------------
-
-        decoded_string = decoded_bytes.decode(
-            "utf-8"
-        )
-
-        # ----------------------------------
-        # 4. Parse JSON
-        # ----------------------------------
-
-        data = json.loads(
-            decoded_string
-        )
-
-        # ----------------------------------
-        # 5. Get input data
-        # ----------------------------------
-
-        adapt_input_data = data.get(
-            "adaptInput",
-            {}
-        )
-
-        heartbeats = data.get(
-            "heartbeats",
-            []
-        )
-
-        slo_query = data.get(
-            "sloQuery",
-            {}
-        )
-
-        # ----------------------------------
-        # 6. Generate adaptOutput
-        # ----------------------------------
-
-        adapt_output = adapt_input(
-            adapt_input_data
-        )
-
-        # ----------------------------------
-        # 7. Generate sloOutput
-        # ----------------------------------
-
-        slo_output = calculate_slo(
-            heartbeats,
-            slo_query
-        )
-
-        # ----------------------------------
-        # 8. Return combined response
-        # ----------------------------------
-
-        return {
-            "adaptOutput": adapt_output,
-            "sloOutput": slo_output
-        }
-
-    except Exception as e:
+    except (
+        binascii.Error,
+        ValueError
+    ):
 
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid payload: {str(e)}"
+            detail="Invalid Base64 payload"
         )
+
+    # --------------------------------------
+    # Decode UTF-8
+    # --------------------------------------
+
+    try:
+
+        decoded_text = decoded_bytes.decode(
+            "utf-8"
+        )
+
+    except UnicodeDecodeError:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Payload is not valid UTF-8"
+        )
+
+    # --------------------------------------
+    # Parse JSON
+    # --------------------------------------
+
+    try:
+
+        data = json.loads(
+            decoded_text
+        )
+
+    except json.JSONDecodeError:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Decoded payload is not valid JSON"
+        )
+
+    # --------------------------------------
+    # Validate root object
+    # --------------------------------------
+
+    if not isinstance(data, dict):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Decoded payload must be a JSON object"
+        )
+
+    # --------------------------------------
+    # Extract sections
+    # --------------------------------------
+
+    adapt_input_data = data.get(
+        "adaptInput",
+        {}
+    )
+
+    heartbeats = data.get(
+        "heartbeats",
+        []
+    )
+
+    slo_query = data.get(
+        "sloQuery",
+        {}
+    )
+
+    if not isinstance(
+        adapt_input_data,
+        dict
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="adaptInput must be an object"
+        )
+
+    if not isinstance(
+        heartbeats,
+        list
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="heartbeats must be an array"
+        )
+
+    if not isinstance(
+        slo_query,
+        dict
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="sloQuery must be an object"
+        )
+
+    # --------------------------------------
+    # Generate outputs
+    # --------------------------------------
+
+    adapt_output = adapt_input(
+        adapt_input_data
+    )
+
+    slo_output = calculate_slo(
+        heartbeats,
+        slo_query
+    )
+
+    # --------------------------------------
+    # Final response
+    # --------------------------------------
+
+    return {
+        "adaptOutput": adapt_output,
+        "sloOutput": slo_output
+    }
+
+
+# ==========================================
+# Local development
+# ==========================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            8000
+        )
+    )
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
